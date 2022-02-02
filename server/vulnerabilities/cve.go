@@ -2,12 +2,15 @@ package vulnerabilities
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,7 +111,7 @@ func checkCVEs(ctx context.Context, ds fleet.Datastore, logger kitlog.Logger, cp
 	}
 	cache := cvefeed.NewCache(dict).SetRequireVersion(true).SetMaxSize(-1)
 	// This index consumes too much RAM
-	//cache.Idx = cvefeed.NewIndex(dict)
+	// cache.Idx = cvefeed.NewIndex(dict)
 
 	cpeCh := make(chan *wfn.Attributes)
 
@@ -172,4 +175,137 @@ func checkCVEs(ctx context.Context, ds fleet.Datastore, logger kitlog.Logger, cp
 	wg.Wait()
 
 	return nil
+}
+
+func PostProcess(
+	ctx context.Context,
+	ds fleet.Datastore,
+	vulnPath string,
+	logger kitlog.Logger,
+	config config.FleetConfig,
+) error {
+	if err := centosPostProcessing(ctx, ds, vulnPath, logger, config); err != nil {
+		return err
+	}
+	return nil
+}
+
+type CentOSPkg struct {
+	Name    string
+	Version string
+	Release string
+	Arch    string
+}
+
+func (p CentOSPkg) String() string {
+	return p.Name + "-" + p.Version + "-" + p.Release + "." + p.Arch
+}
+
+type CVESet map[string]struct{}
+
+type CentOSPkgSet map[CentOSPkg]CVESet
+
+func (p CentOSPkgSet) Add(pkg CentOSPkg, cve string) {
+	s := p[pkg]
+	if s == nil {
+		s = make(CVESet)
+	}
+	s[cve] = struct{}{}
+	p[pkg] = s
+}
+
+func centosPostProcessing(
+	ctx context.Context,
+	ds fleet.Datastore,
+	vulnPath string,
+	logger kitlog.Logger,
+	config config.FleetConfig,
+) error {
+	dbFilePath := filepath.Join(vulnPath, "centos_cve.sqlite")
+	switch _, err := os.Stat(dbFilePath); {
+	case err == nil:
+		// OK
+	case errors.Is(err, os.ErrNotExist):
+		level.Info(logger).Log("msg", "centos_cve.sqlite not found, skipping CentOS post-processing")
+		return nil
+	default:
+		return err
+	}
+	db, err := sql.Open("sqlite3", dbFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open centos db: %w", err)
+	}
+	centOSPkgs, err := loadCentOSCVEs(ctx, db)
+	if err != nil {
+		return fmt.Errorf("failed to fetch CentOS packages: %w", err)
+	}
+	rpmVulnerable, err := ds.ListVulnerableSoftwareBySource(ctx, "rpm_packages")
+	if err != nil {
+		return fmt.Errorf("failed to list vulnerable software: %w", err)
+	}
+	level.Info(logger).Log("centosPackages", len(centOSPkgs), "vulnerable", len(rpmVulnerable))
+	var fixedCVEs []fleet.SoftwareVulnerability
+	for _, software := range rpmVulnerable {
+		if software.Vendor == nil || *software.Vendor != "CentOS" {
+			continue
+		}
+		release := ""
+		if software.Release != nil {
+			release = *software.Release
+		}
+		arch := ""
+		if software.Arch != nil {
+			arch = *software.Arch
+		}
+		pkgCVEs, ok := centOSPkgs[CentOSPkg{
+			Name:    software.Name,
+			Version: software.Version,
+			Release: release,
+			Arch:    arch,
+		}]
+		if !ok {
+			continue
+		}
+		for _, vulnerability := range software.Vulnerabilities {
+			if _, ok := pkgCVEs[vulnerability.CVE]; ok {
+				level.Info(logger).Log("fixedVuln", software.Name, "cve", vulnerability.CVE)
+				fixedCVEs = append(fixedCVEs, fleet.SoftwareVulnerability{
+					CPE: software.CPE,
+					CVE: vulnerability.CVE,
+				})
+			}
+		}
+	}
+
+	level.Info(logger).Log("fixedCVEsCount", len(fixedCVEs))
+	level.Debug(logger).Log("fixedCVEs", fmt.Sprintf("%+v", fixedCVEs))
+
+	if err := ds.DeleteVulnerabilities(ctx, fixedCVEs); err != nil {
+		return fmt.Errorf("failed to delete fixed vulnerabilities: %w", err)
+	}
+	return nil
+}
+
+func loadCentOSCVEs(ctx context.Context, db *sql.DB) (CentOSPkgSet, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name, version, release, arch, cves from pkgs_cves`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch packages: %w", err)
+	}
+	defer rows.Close()
+
+	pkgs := make(CentOSPkgSet)
+	for rows.Next() {
+		var pkg CentOSPkg
+		var cves string
+		if err := rows.Scan(&pkg.Name, &pkg.Version, &pkg.Release, &pkg.Arch, &cves); err != nil {
+			return nil, err
+		}
+		for _, cve := range strings.Split(cves, ",") {
+			pkgs.Add(pkg, "CVE-"+cve)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to traverse packages: %w", err)
+	}
+	return pkgs, nil
 }

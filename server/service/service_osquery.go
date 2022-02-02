@@ -704,6 +704,9 @@ func (svc *Service) SubmitDistributedQueryResults(
 		// osquery docs say any nonzero (string) value for status indicates a query error
 		status, ok := statuses[query]
 		failed := ok && status != fleet.StatusOK
+		if failed && messages[query] != "" {
+			level.Debug(svc.logger).Log("query", query, "message", messages[query])
+		}
 		var err error
 		switch {
 		case strings.HasPrefix(query, hostDetailQueryPrefix):

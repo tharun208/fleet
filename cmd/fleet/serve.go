@@ -715,6 +715,12 @@ func cronVulnerabilities(
 			continue
 		}
 
+		if err := vulnerabilities.PostProcess(ctx, ds, vulnPath, logger, config); err != nil {
+			level.Error(logger).Log("msg", "post processing CVEs", "err", err)
+			sentry.CaptureException(err)
+			return
+		}
+
 		level.Debug(logger).Log("loop", "done")
 	}
 }

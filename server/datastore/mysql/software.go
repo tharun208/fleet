@@ -29,16 +29,42 @@ func truncateString(str string, length int) string {
 }
 
 func softwareToUniqueString(s fleet.Software) string {
-	return strings.Join([]string{s.Name, s.Version, s.Source, s.BundleIdentifier}, "\u0000")
+	ss := []string{s.Name, s.Version, s.Source, s.BundleIdentifier}
+	if s.Release != nil || s.Vendor != nil || s.Arch != nil {
+		release := ""
+		if s.Release != nil {
+			release = *s.Release
+		}
+		ss = append(ss, release)
+		vendor := ""
+		if s.Vendor != nil {
+			vendor = *s.Vendor
+		}
+		ss = append(ss, vendor)
+		arch := ""
+		if s.Arch != nil {
+			arch = *s.Arch
+		}
+		ss = append(ss, arch)
+	}
+	return strings.Join(ss, "\u0000")
 }
 
 func uniqueStringToSoftware(s string) fleet.Software {
 	parts := strings.Split(s, "\u0000")
+	var release, vendor, arch *string
+	if len(parts) > 4 {
+		release, vendor, arch = &parts[4], &parts[5], &parts[6]
+	}
 	return fleet.Software{
 		Name:             truncateString(parts[0], maxSoftwareNameLen),
 		Version:          truncateString(parts[1], maxSoftwareVersionLen),
 		Source:           truncateString(parts[2], maxSoftwareSourceLen),
 		BundleIdentifier: truncateString(parts[3], maxSoftwareBundleIdentifierLen),
+
+		Release: release,
+		Vendor:  vendor,
+		Arch:    arch,
 	}
 }
 
@@ -151,8 +177,10 @@ func getOrGenerateSoftwareIdDB(ctx context.Context, tx sqlx.ExtContext, s fleet.
 	var existingId []int64
 	if err := sqlx.SelectContext(ctx, tx,
 		&existingId,
-		`SELECT id FROM software WHERE name = ? AND version = ? AND source = ? AND bundle_identifier = ?`,
-		s.Name, s.Version, s.Source, s.BundleIdentifier,
+		"SELECT id FROM software "+
+			"WHERE name = ? AND version = ? AND source = ? AND `release` = ? AND "+
+			"vendor = ? AND arch = ? AND bundle_identifier = ?",
+		s.Name, s.Version, s.Source, s.Release, s.Vendor, s.Arch, s.BundleIdentifier,
 	); err != nil {
 		return 0, ctxerr.Wrap(ctx, err, "get software")
 	}
@@ -161,9 +189,11 @@ func getOrGenerateSoftwareIdDB(ctx context.Context, tx sqlx.ExtContext, s fleet.
 	}
 
 	result, err := tx.ExecContext(ctx,
-		`INSERT INTO software (name, version, source, bundle_identifier) VALUES (?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE bundle_identifier=VALUES(bundle_identifier)`,
-		s.Name, s.Version, s.Source, s.BundleIdentifier,
+		"INSERT INTO software "+
+			"(name, version, source, `release`, vendor, arch, bundle_identifier) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE bundle_identifier=VALUES(bundle_identifier)",
+		s.Name, s.Version, s.Source, s.Release, s.Vendor, s.Arch, s.BundleIdentifier,
 	)
 	if err != nil {
 		return 0, ctxerr.Wrap(ctx, err, "insert software")
@@ -499,6 +529,57 @@ func (d *Datastore) ListSoftware(ctx context.Context, opt fleet.SoftwareListOpti
 
 func (d *Datastore) CountSoftware(ctx context.Context, opt fleet.SoftwareListOptions) (int, error) {
 	return countSoftwareDB(ctx, d.reader, nil, opt)
+}
+
+func (d *Datastore) ListVulnerableSoftwareBySource(ctx context.Context, source string) ([]fleet.SoftwareWithCPE, error) {
+	var softwareCVEs []struct {
+		fleet.Software
+		CPE  uint   `db:"cpe_id"`
+		CVEs string `db:"cves"`
+	}
+	if err := sqlx.SelectContext(ctx, d.reader, &softwareCVEs, `
+		SELECT s.*, scv.cpe_id, GROUP_CONCAT(scv.cve SEPARATOR ',') as cves
+		FROM software s
+		JOIN software_cpe scp ON (s.id=scp.software_id)
+		JOIN software_cve scv ON (scp.id=scv.cpe_id)
+		WHERE s.source = ?
+		GROUP BY scv.cpe_id
+	`, source); err != nil {
+		return nil, ctxerr.Wrapf(ctx, err, "listing vulnerable software by source")
+	}
+	software := make([]fleet.SoftwareWithCPE, 0, len(softwareCVEs))
+	for _, sc := range softwareCVEs {
+		for _, cve := range strings.Split(sc.CVEs, ",") {
+			sc.Software.Vulnerabilities = append(sc.Software.Vulnerabilities, fleet.SoftwareCVE{
+				CVE:         cve,
+				DetailsLink: fmt.Sprintf("https://nvd.nist.gov/vuln/detail/%s", cve),
+			})
+		}
+		software = append(software, fleet.SoftwareWithCPE{
+			Software: sc.Software,
+			CPE:      sc.CPE,
+		})
+	}
+	return software, nil
+}
+
+func (d *Datastore) DeleteVulnerabilities(ctx context.Context, vulnerabilities []fleet.SoftwareVulnerability) error {
+	if len(vulnerabilities) == 0 {
+		return nil
+	}
+
+	sql := fmt.Sprintf(
+		`DELETE FROM software_cve WHERE (cpe_id, cve) IN (%s)`,
+		strings.TrimSuffix(strings.Repeat("(?,?),", len(vulnerabilities)), ","),
+	)
+	var args []interface{}
+	for _, vulnerability := range vulnerabilities {
+		args = append(args, vulnerability.CPE, vulnerability.CVE)
+	}
+	if _, err := d.writer.ExecContext(ctx, sql, args...); err != nil {
+		return ctxerr.Wrapf(ctx, err, "deleting vulnerable software")
+	}
+	return nil
 }
 
 func (d *Datastore) SoftwareByID(ctx context.Context, id uint) (*fleet.Software, error) {

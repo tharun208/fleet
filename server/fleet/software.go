@@ -19,6 +19,10 @@ type Software struct {
 	// Source is the source of the data (osquery table name).
 	Source string `json:"source" db:"source"`
 
+	Release *string
+	Vendor  *string
+	Arch    *string
+
 	// GenerateCPE is the CPE23 string that corresponds to the current software
 	GenerateCPE string `json:"generated_cpe" db:"generated_cpe"`
 	// Vulnerabilities lists all the found CVEs for the CPE

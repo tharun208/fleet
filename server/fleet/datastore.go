@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -373,6 +374,8 @@ type Datastore interface {
 
 	ListSoftware(ctx context.Context, opt SoftwareListOptions) ([]Software, error)
 	CountSoftware(ctx context.Context, opt SoftwareListOptions) (int, error)
+	ListVulnerableSoftwareBySource(ctx context.Context, source string) ([]SoftwareWithCPE, error)
+	DeleteVulnerabilities(ctx context.Context, vulnerabilities []SoftwareVulnerability) error
 
 	///////////////////////////////////////////////////////////////////////////////
 	// Team Policies
@@ -532,6 +535,20 @@ const (
 	// UnknownMigrations means some unidentified migrations were detected on the database.
 	UnknownMigrations
 )
+
+type SoftwareVulnerability struct {
+	CPE uint   `db:"cpe_id"`
+	CVE string `db:"cve"`
+}
+
+func (sv SoftwareVulnerability) String() string {
+	return fmt.Sprintf("{%d,%s}", sv.CPE, sv.CVE)
+}
+
+type SoftwareWithCPE struct {
+	Software
+	CPE uint
+}
 
 // NotFoundError is returned when the datastore resource cannot be found.
 type NotFoundError interface {
